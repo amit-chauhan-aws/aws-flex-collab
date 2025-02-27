@@ -1,0 +1,114 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - "*"
+  paths:
+    include:
+      - Env/**
+
+stages:
+# -------------------------------
+# Stage 1: Terraform Plan
+# -------------------------------
+- stage: TerraformPlan
+  displayName: "Terraform Plan Stage"
+  jobs:
+  - job: TerraformPlanJob
+    displayName: "Plan for Changed Folders"
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - script: |
+        #!/bin/bash
+        echo "Fetching changes compared to origin/main..."
+        git fetch origin main
+
+        # List changed files relative to origin/main
+        CHANGED_FILES=$(git diff --name-only origin/main)
+        echo "Changed files:"
+        echo "$CHANGED_FILES"
+
+        # Extract unique folder paths in the format: Env/<env>/<region>/<module>
+        FOLDERS=$(echo "$CHANGED_FILES" | grep '^Env/' | awk -F/ '{print $1"/"$2"/"$3"/"$4}' | sort | uniq)
+        echo "Detected changed folders:"
+        echo "$FOLDERS"
+
+        # Loop through each folder and run Terraform plan
+        for folder in $FOLDERS; do
+          echo "------------------------------"
+          echo "Processing folder: $folder"
+          if [ -d "$folder" ]; then
+            pushd "$folder" || exit 1
+            echo "Initializing Terraform in $folder"
+            terraform init
+            echo "Running Terraform plan in $folder"
+            terraform plan -out=tfplan
+            # Generate a unique plan file name by replacing slashes with underscores
+            PLAN_NAME=$(echo $folder | tr '/' '_')
+            echo "Renaming plan file to ../tfplan_$PLAN_NAME"
+            mv tfplan ../tfplan_$PLAN_NAME
+            popd || exit 1
+          else
+            echo "Folder $folder does not exist. Skipping."
+          fi
+        done
+      displayName: "Detect changes and run Terraform Plan"
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)'
+        ArtifactName: 'tfplans'
+      displayName: "Publish Terraform Plan Artifacts"
+
+# -------------------------------
+# Stage 2: Terraform Apply
+# -------------------------------
+- stage: TerraformApply
+  displayName: "Terraform Apply Stage"
+  dependsOn: TerraformPlan
+  condition: succeeded()
+  # This stage will require manual approval via environment protection settings or a manual trigger.
+  jobs:
+  - job: TerraformApplyJob
+    displayName: "Apply for Changed Folders"
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - download: current
+      artifact: 'tfplans'
+    - script: |
+        #!/bin/bash
+        echo "Fetching changes compared to origin/main..."
+        git fetch origin main
+
+        # List changed files relative to origin/main
+        CHANGED_FILES=$(git diff --name-only origin/main)
+        echo "Changed files:"
+        echo "$CHANGED_FILES"
+
+        # Extract unique folder paths in the format: Env/<env>/<region>/<module>
+        FOLDERS=$(echo "$CHANGED_FILES" | grep '^Env/' | awk -F/ '{print $1"/"$2"/"$3"/"$4}' | sort | uniq)
+        echo "Detected changed folders:"
+        echo "$FOLDERS"
+
+        # Loop through each folder and run Terraform apply using the corresponding plan
+        for folder in $FOLDERS; do
+          echo "------------------------------"
+          echo "Applying changes for folder: $folder"
+          if [ -d "$folder" ]; then
+            pushd "$folder" || exit 1
+            echo "Initializing Terraform in $folder"
+            terraform init 
+            # Generate the plan file name (same as in plan stage)
+            PLAN_NAME=$(echo $folder | tr '/' '_')
+            echo "Applying Terraform plan from ../tfplan_$PLAN_NAME"
+            terraform apply -auto-approve ../tfplan_$PLAN_NAME
+            popd || exit 1
+          else
+            echo "Folder $folder does not exist. Skipping."
+          fi
+        done
+      displayName: "Run Terraform Apply for Changed Folders"
